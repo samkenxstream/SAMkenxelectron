@@ -5,6 +5,8 @@ const fs = require('fs');
 const got = require('got');
 const path = require('path');
 const { handleGitCall, ELECTRON_DIR } = require('./lib/utils.js');
+const { Octokit } = require('@octokit/rest');
+const octokit = new Octokit();
 
 const APPVEYOR_IMAGES_URL = 'https://ci.appveyor.com/api/build-clouds';
 const APPVEYOR_JOB_URL = 'https://ci.appveyor.com/api/builds';
@@ -58,7 +60,7 @@ async function checkAppVeyorImage (options) {
   };
 
   try {
-    const { settings } = await makeRequest(requestOpts, true);
+    const { settings } = await makeRequest(requestOpts);
     const { cloudSettings } = settings;
     return cloudSettings.images.find(image => image.name === `${options.imageVersion}`) || null;
   } catch (err) {
@@ -66,17 +68,35 @@ async function checkAppVeyorImage (options) {
   }
 }
 
-function useAppVeyorImage (targetBranch, options) {
-  const validJobs = Object.keys(appVeyorJobs);
-  if (options.job) {
-    assert(validJobs.includes(options.job), `Unknown AppVeyor CI job name: ${options.job}.  Valid values are: ${validJobs}.`);
-    callAppVeyorBuildJobs(targetBranch, options.job, options);
+async function getPullRequestId (targetBranch) {
+  // AppVeyor doesn't provide a PR number for branch builds - figure it out from the branch
+  const prsForBranch = await octokit.pulls.list({
+    owner: 'electron',
+    repo: 'electron',
+    state: 'open',
+    head: `electron:${targetBranch}`
+  });
+  if (prsForBranch.data.length === 1) {
+    const id = prsForBranch.data[0].number;
+    console.log('pullRequestNumber: ', id);
+    return id;
   } else {
-    validJobs.forEach((job) => callAppVeyorBuildJobs(targetBranch, job, options));
+    return null;
   }
 }
 
-async function callAppVeyorBuildJobs (targetBranch, job, options) {
+function useAppVeyorImage (targetBranch, options) {
+  const validJobs = Object.keys(appVeyorJobs);
+  const pullRequestId = getPullRequestId(targetBranch);
+  if (options.job) {
+    assert(validJobs.includes(options.job), `Unknown AppVeyor CI job name: ${options.job}.  Valid values are: ${validJobs}.`);
+    callAppVeyorBuildJobs(targetBranch, pullRequestId, options.job, options);
+  } else {
+    validJobs.forEach((job) => callAppVeyorBuildJobs(targetBranch, pullRequestId, job, options));
+  }
+}
+
+async function callAppVeyorBuildJobs (targetBranch, pullRequestId, job, options) {
   console.log(`Using AppVeyor image ${options.version} for ${job}`);
   const environmentVariables = {
     APPVEYOR_BUILD_WORKER_CLOUD: DEFAULT_BUILD_CLOUD,
@@ -95,6 +115,7 @@ async function callAppVeyorBuildJobs (targetBranch, job, options) {
       accountName: 'electron-bot',
       projectSlug: appVeyorJobs[job],
       branch: targetBranch,
+      pullRequestId: pullRequestId,
       commitId: options.commit || undefined,
       environmentVariables
     }),
@@ -102,7 +123,7 @@ async function callAppVeyorBuildJobs (targetBranch, job, options) {
   };
 
   try {
-    const { version } = await makeRequest(requestOpts, true);
+    const { version } = await makeRequest(requestOpts);
     const buildUrl = `https://ci.appveyor.com/project/electron-bot/${appVeyorJobs[job]}/build/${version}`;
     console.log(`AppVeyor CI request for ${job} successful.  Check status at ${buildUrl}`);
   } catch (err) {
@@ -138,7 +159,7 @@ async function bakeAppVeyorImage (targetBranch, options) {
   };
 
   try {
-    const { version } = await makeRequest(requestOpts, true);
+    const { version } = await makeRequest(requestOpts);
     const bakeUrl = `https://ci.appveyor.com/project/electron-bot/${appveyorBakeJob}/build/${version}`;
     console.log(`AppVeyor image bake request for ${options.version} successful.  Check bake status at ${bakeUrl}`);
   } catch (err) {
@@ -158,7 +179,7 @@ async function prepareAppVeyorImage (opts) {
     const [, CHROMIUM_VERSION] = versionRegex.exec(deps);
 
     const cloudId = opts.cloudId || DEFAULT_BUILD_CLOUD_ID;
-    const imageVersion = opts.imageVersion || `electron-test-default-${CHROMIUM_VERSION}`;
+    const imageVersion = opts.imageVersion || `electron-test-${CHROMIUM_VERSION}`;
     const image = await checkAppVeyorImage({ cloudId, imageVersion });
 
     if (image && image.name) {

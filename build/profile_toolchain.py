@@ -1,22 +1,23 @@
 from __future__ import unicode_literals
+from get_toolchain_if_necessary import CalculateHash
+from vs_toolchain import \
+    SetEnvironmentAndGetRuntimeDllDirs, \
+    SetEnvironmentAndGetSDKDir, \
+    NormalizePath
+import find_depot_tools
 import contextlib
 import sys
 import os
 import optparse
 import json
+import re
 import subprocess
 
 sys.path.append("%s/../../build" % os.path.dirname(os.path.realpath(__file__)))
 
-import find_depot_tools
-from vs_toolchain import \
-    SetEnvironmentAndGetRuntimeDllDirs, \
-    SetEnvironmentAndGetSDKDir, \
-    NormalizePath
 
-sys.path.append("%s/win_toolchain" % find_depot_tools.add_depot_tools_to_path())
-
-from get_toolchain_if_necessary import CalculateHash
+sys.path.append("%s/win_toolchain" %
+                find_depot_tools.add_depot_tools_to_path())
 
 
 @contextlib.contextmanager
@@ -32,6 +33,7 @@ def cwd(directory):
 def calculate_hash(root):
     with cwd(root):
         return CalculateHash('.', None)
+
 
 def windows_installed_software():
     powershell_command = [
@@ -63,14 +65,27 @@ def windows_installed_software():
 
     stdout, _ = proc.communicate(" ".join(powershell_command).encode("utf-8"))
 
+    print("Proc: ", proc)
+
     if proc.returncode != 0:
         raise RuntimeError("Failed to get list of installed software")
+
+    # On AppVeyor there's other output related to PSReadline,
+    # so grab only the JSON output and ignore everything else
+    json_match = re.match(
+        r".*(\[.*{.*}.*\]).*", stdout.decode("utf-8"), re.DOTALL
+    )
+
+    if not json_match:
+        raise RuntimeError(
+            "Couldn't find JSON output for list of installed software"
+        )
 
     # Filter out missing keys
     return list(
         map(
             lambda info: {k: info[k] for k in info if info[k]},
-            json.loads(stdout.decode("utf-8")),
+            json.loads(json_match.group(1)),
         )
     )
 
