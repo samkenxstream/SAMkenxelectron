@@ -13,6 +13,7 @@
 #include "electron/buildflags/buildflags.h"
 #include "gin/handle.h"
 #include "gin/wrappable.h"
+#include "services/network/public/mojom/host_resolver.mojom.h"
 #include "services/network/public/mojom/ssl_config.mojom.h"
 #include "shell/browser/event_emitter_mixin.h"
 #include "shell/browser/net/resolve_proxy_helper.h"
@@ -82,6 +83,12 @@ class Session : public gin::Wrappable<Session>,
                                             const std::string& partition,
                                             base::Value::Dict options = {});
 
+  // Gets the Session based on |path|.
+  static absl::optional<gin::Handle<Session>> FromPath(
+      v8::Isolate* isolate,
+      const base::FilePath& path,
+      base::Value::Dict options = {});
+
   ElectronBrowserContext* browser_context() const { return browser_context_; }
 
   // gin::Wrappable
@@ -90,6 +97,9 @@ class Session : public gin::Wrappable<Session>,
   const char* GetTypeName() override;
 
   // Methods.
+  v8::Local<v8::Promise> ResolveHost(
+      std::string host,
+      absl::optional<network::mojom::ResolveHostParametersPtr> params);
   v8::Local<v8::Promise> ResolveProxy(gin::Arguments* args);
   v8::Local<v8::Promise> GetCacheSize();
   v8::Local<v8::Promise> ClearCache();

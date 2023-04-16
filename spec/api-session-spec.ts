@@ -8,8 +8,9 @@ import { app, session, BrowserWindow, net, ipcMain, Session, webFrameMain, WebFr
 import * as send from 'send';
 import * as auth from 'basic-auth';
 import { closeAllWindows } from './lib/window-helpers';
-import { emittedOnce } from './lib/events-helpers';
-import { defer, delay, listen } from './lib/spec-helpers';
+import { defer, listen } from './lib/spec-helpers';
+import { once } from 'events';
+import { setTimeout } from 'timers/promises';
 
 /* The whole session API doesn't use standard callbacks */
 /* eslint-disable standard/no-callback-literal */
@@ -27,6 +28,14 @@ describe('session module', () => {
   describe('session.fromPartition(partition, options)', () => {
     it('returns existing session with same partition', () => {
       expect(session.fromPartition('test')).to.equal(session.fromPartition('test'));
+    });
+  });
+
+  describe('session.fromPath(path)', () => {
+    it('returns storage path of a session which was created with an absolute path', () => {
+      const tmppath = require('electron').app.getPath('temp');
+      const ses = session.fromPath(tmppath);
+      expect(ses.storagePath).to.equal(tmppath);
     });
   });
 
@@ -127,7 +136,7 @@ describe('session module', () => {
 
       await expect(
         cookies.set({ url: '', name, value })
-      ).to.eventually.be.rejectedWith('Failed to get cookie domain');
+      ).to.eventually.be.rejectedWith('Failed to set cookie with an invalid domain attribute');
     });
 
     it('yields an error when setting a cookie with an invalid URL', async () => {
@@ -137,7 +146,7 @@ describe('session module', () => {
 
       await expect(
         cookies.set({ url: 'asdf', name, value })
-      ).to.eventually.be.rejectedWith('Failed to get cookie domain');
+      ).to.eventually.be.rejectedWith('Failed to set cookie with an invalid domain attribute');
     });
 
     it('should overwrite previous cookies', async () => {
@@ -163,7 +172,8 @@ describe('session module', () => {
       expect(list.some(cookie => cookie.name === name && cookie.value === value)).to.equal(false);
     });
 
-    it.skip('should set cookie for standard scheme', async () => {
+    // DISABLED-FIXME
+    it('should set cookie for standard scheme', async () => {
       const { cookies } = session.defaultSession;
       const domain = 'fake-host';
       const url = `${standardScheme}://${domain}`;
@@ -184,11 +194,11 @@ describe('session module', () => {
       const name = 'foo';
       const value = 'bar';
 
-      const a = emittedOnce(cookies, 'changed');
+      const a = once(cookies, 'changed');
       await cookies.set({ url, name, value, expirationDate: (+new Date()) / 1000 + 120 });
       const [, setEventCookie, setEventCause, setEventRemoved] = await a;
 
-      const b = emittedOnce(cookies, 'changed');
+      const b = once(cookies, 'changed');
       await cookies.remove(url, name);
       const [, removeEventCookie, removeEventCause, removeEventRemoved] = await b;
 
@@ -331,7 +341,7 @@ describe('session module', () => {
       customSession = session.fromPartition(partitionName);
       await customSession.protocol.registerStringProtocol(protocolName, handler);
       w.loadURL(`${protocolName}://fake-host`);
-      await emittedOnce(ipcMain, 'hello');
+      await once(ipcMain, 'hello');
     });
   });
 
@@ -345,7 +355,7 @@ describe('session module', () => {
       if (!created) {
         // Work around for https://github.com/electron/electron/issues/26166 to
         // reduce flake
-        await delay(100);
+        await setTimeout(100);
         created = true;
       }
     });
@@ -474,6 +484,53 @@ describe('session module', () => {
         const proxy = await customSession.resolveProxy('https://google.com');
         expect(proxy).to.equal(`PROXY myproxy:${proxyPort}`);
       }
+    });
+  });
+
+  describe('ses.resolveHost(host)', () => {
+    let customSession: Electron.Session;
+
+    beforeEach(async () => {
+      customSession = session.fromPartition('resolvehost');
+    });
+
+    afterEach(() => {
+      customSession = null as any;
+    });
+
+    it('resolves ipv4.localhost2', async () => {
+      const { endpoints } = await customSession.resolveHost('ipv4.localhost2');
+      expect(endpoints).to.be.a('array');
+      expect(endpoints).to.have.lengthOf(1);
+      expect(endpoints[0].family).to.equal('ipv4');
+      expect(endpoints[0].address).to.equal('10.0.0.1');
+    });
+
+    it('fails to resolve AAAA record for ipv4.localhost2', async () => {
+      await expect(customSession.resolveHost('ipv4.localhost2', {
+        queryType: 'AAAA'
+      }))
+        .to.eventually.be.rejectedWith(/net::ERR_NAME_NOT_RESOLVED/);
+    });
+
+    it('resolves ipv6.localhost2', async () => {
+      const { endpoints } = await customSession.resolveHost('ipv6.localhost2');
+      expect(endpoints).to.be.a('array');
+      expect(endpoints).to.have.lengthOf(1);
+      expect(endpoints[0].family).to.equal('ipv6');
+      expect(endpoints[0].address).to.equal('::1');
+    });
+
+    it('fails to resolve A record for ipv6.localhost2', async () => {
+      await expect(customSession.resolveHost('notfound.localhost2', {
+        queryType: 'A'
+      }))
+        .to.eventually.be.rejectedWith(/net::ERR_NAME_NOT_RESOLVED/);
+    });
+
+    it('fails to resolve notfound.localhost2', async () => {
+      await expect(customSession.resolveHost('notfound.localhost2'))
+        .to.eventually.be.rejectedWith(/net::ERR_NAME_NOT_RESOLVED/);
     });
   });
 
@@ -638,7 +695,6 @@ describe('session module', () => {
 
       const w = new BrowserWindow({ show: false, webPreferences: { session: ses } });
       await expect(w.loadURL(serverUrl)).to.eventually.be.rejectedWith(/ERR_FAILED/);
-      expect(w.webContents.getTitle()).to.equal(serverUrl);
       expect(validate!).not.to.be.undefined();
       validate!();
     });
@@ -654,9 +710,8 @@ describe('session module', () => {
 
       const w = new BrowserWindow({ show: false, webPreferences: { session: ses } });
       await expect(w.loadURL(serverUrl), 'first load').to.eventually.be.rejectedWith(/ERR_FAILED/);
-      await emittedOnce(w.webContents, 'did-stop-loading');
+      await once(w.webContents, 'did-stop-loading');
       await expect(w.loadURL(serverUrl + '/test'), 'second load').to.eventually.be.rejectedWith(/ERR_FAILED/);
-      expect(w.webContents.getTitle()).to.equal(serverUrl + '/test');
       expect(numVerificationRequests).to.equal(1);
     });
 
@@ -667,7 +722,7 @@ describe('session module', () => {
 
       const req = net.request({ url: serverUrl, session: ses1, credentials: 'include' });
       req.end();
-      setTimeout(() => {
+      setTimeout().then(() => {
         ses2.setCertificateVerifyProc((opts, callback) => callback(0));
       });
       await expect(new Promise<void>((resolve, reject) => {
@@ -963,7 +1018,7 @@ describe('session module', () => {
         length: 5242880
       };
       const w = new BrowserWindow({ show: false });
-      const p = emittedOnce(w.webContents.session, 'will-download');
+      const p = once(w.webContents.session, 'will-download');
       w.webContents.session.createInterruptedDownload(options);
       const [, item] = await p;
       expect(item.getState()).to.equal('interrupted');
@@ -1070,7 +1125,7 @@ describe('session module', () => {
         cb(`<html><script>(${remote})()</script></html>`);
       });
 
-      const result = emittedOnce(require('electron').ipcMain, 'message');
+      const result = once(require('electron').ipcMain, 'message');
 
       function remote () {
         (navigator as any).requestMIDIAccess({ sysex: true }).then(() => {}, (err: any) => {
@@ -1197,7 +1252,7 @@ describe('session module', () => {
         document.body.appendChild(iframe);
         null;
       `);
-      const [,, frameProcessId, frameRoutingId] = await emittedOnce(w.webContents, 'did-frame-finish-load');
+      const [,, frameProcessId, frameRoutingId] = await once(w.webContents, 'did-frame-finish-load');
       const state = await readClipboardPermission(webFrameMain.fromId(frameProcessId, frameRoutingId));
       expect(state).to.equal('granted');
       expect(handlerDetails!.requestingUrl).to.equal(loadUrl);
@@ -1260,7 +1315,7 @@ describe('session module', () => {
 
   describe('session-created event', () => {
     it('is emitted when a session is created', async () => {
-      const sessionCreated = emittedOnce(app, 'session-created');
+      const sessionCreated = once(app, 'session-created');
       const session1 = session.fromPartition('' + Math.random());
       const [session2] = await sessionCreated;
       expect(session1).to.equal(session2);

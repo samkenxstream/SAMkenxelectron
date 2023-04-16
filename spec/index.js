@@ -1,3 +1,4 @@
+const fs = require('fs');
 const path = require('path');
 const v8 = require('v8');
 
@@ -21,6 +22,11 @@ app.on('window-all-closed', () => null);
 // Use fake device for Media Stream to replace actual camera and microphone.
 app.commandLine.appendSwitch('use-fake-device-for-media-stream');
 app.commandLine.appendSwitch('host-rules', 'MAP localhost2 127.0.0.1');
+app.commandLine.appendSwitch('host-resolver-rules', [
+  'MAP ipv4.localhost2 10.0.0.1',
+  'MAP ipv6.localhost2 [::1]',
+  'MAP notfound.localhost2 ~NOTFOUND'
+].join(', '));
 
 global.standardScheme = 'app';
 global.zoomScheme = 'zoom';
@@ -64,6 +70,19 @@ app.whenReady().then(async () => {
     };
   }
   const mocha = new Mocha(mochaOptions);
+
+  // Add a root hook on mocha to skip any tests that are disabled
+  const disabledTests = new Set(
+    JSON.parse(
+      fs.readFileSync(path.join(__dirname, 'disabled-tests.json'), 'utf8')
+    )
+  );
+  mocha.suite.beforeEach(function () {
+    // TODO(clavin): add support for disabling *suites* by title, not just tests
+    if (disabledTests.has(this.currentTest?.fullTitle())) {
+      this.skip();
+    }
+  });
 
   // The cleanup method is registered this way rather than through an
   // `afterEach` at the top level so that it can run before other `afterEach`

@@ -64,6 +64,7 @@
 #include "gin/handle.h"
 #include "gin/object_template_builder.h"
 #include "gin/wrappable.h"
+#include "media/base/mime_util.h"
 #include "mojo/public/cpp/bindings/associated_remote.h"
 #include "mojo/public/cpp/bindings/pending_receiver.h"
 #include "mojo/public/cpp/bindings/remote.h"
@@ -112,6 +113,7 @@
 #include "shell/common/gin_converters/gurl_converter.h"
 #include "shell/common/gin_converters/image_converter.h"
 #include "shell/common/gin_converters/net_converter.h"
+#include "shell/common/gin_converters/optional_converter.h"
 #include "shell/common/gin_converters/value_converter.h"
 #include "shell/common/gin_helper/dictionary.h"
 #include "shell/common/gin_helper/object_template_builder.h"
@@ -495,8 +497,7 @@ scoped_refptr<base::TaskRunner> CreatePrinterHandlerTaskRunner() {
 #elif BUILDFLAG(IS_WIN)
   // Windows drivers are likely not thread-safe and need to be accessed on the
   // UI thread.
-  return content::GetUIThreadTaskRunner(
-      {base::MayBlock(), base::TaskPriority::USER_VISIBLE});
+  return content::GetUIThreadTaskRunner({base::TaskPriority::USER_VISIBLE});
 #else
   // Be conservative on unsupported platforms.
   return base::ThreadPool::CreateSingleThreadTaskRunner(kTraits);
@@ -620,6 +621,23 @@ void SetBackgroundColor(content::RenderWidgetHostView* rwhv, SkColor color) {
   rwhv->SetBackgroundColor(color);
   static_cast<content::RenderWidgetHostViewBase*>(rwhv)
       ->SetContentBackgroundColor(color);
+}
+
+content::RenderFrameHost* GetRenderFrameHost(
+    content::NavigationHandle* navigation_handle) {
+  int frame_tree_node_id = navigation_handle->GetFrameTreeNodeId();
+  content::FrameTreeNode* frame_tree_node =
+      content::FrameTreeNode::GloballyFindByID(frame_tree_node_id);
+  content::RenderFrameHostManager* render_manager =
+      frame_tree_node->render_manager();
+  content::RenderFrameHost* frame_host = nullptr;
+  if (render_manager) {
+    frame_host = render_manager->speculative_frame_host();
+    if (!frame_host)
+      frame_host = render_manager->current_frame_host();
+  }
+
+  return frame_host;
 }
 
 }  // namespace
@@ -1222,9 +1240,7 @@ void WebContents::CloseContents(content::WebContents* source) {
   for (ExtendedWebContentsObserver& observer : observers_)
     observer.OnCloseContents();
 
-  // If there are observers, OnCloseContents will call Destroy()
-  if (observers_.empty())
-    Destroy();
+  Destroy();
 }
 
 void WebContents::ActivateContents(content::WebContents* source) {
@@ -1508,11 +1524,17 @@ content::JavaScriptDialogManager* WebContents::GetJavaScriptDialogManager(
 }
 
 void WebContents::OnAudioStateChanged(bool audible) {
-  Emit("-audio-state-changed", audible);
+  v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+  v8::HandleScope handle_scope(isolate);
+  gin::Handle<gin_helper::internal::Event> event =
+      gin_helper::internal::Event::New(isolate);
+  v8::Local<v8::Object> event_object = event.ToV8().As<v8::Object>();
+  gin::Dictionary dict(isolate, event_object);
+  dict.Set("audible", audible);
+  EmitWithoutEvent("audio-state-changed", event);
 }
 
-void WebContents::BeforeUnloadFired(bool proceed,
-                                    const base::TimeTicks& proceed_time) {
+void WebContents::BeforeUnloadFired(bool proceed) {
   // Do nothing, we override this method just to avoid compilation error since
   // there are two virtual functions named BeforeUnloadFired.
 }
@@ -1621,8 +1643,7 @@ void WebContents::RenderFrameHostChanged(content::RenderFrameHost* old_host,
   //
   // |old_host| can be a nullptr so we use |new_host| for looking up the
   // WebFrameMain instance.
-  auto* web_frame =
-      WebFrameMain::FromFrameTreeNodeId(new_host->GetFrameTreeNodeId());
+  auto* web_frame = WebFrameMain::FromRenderFrameHost(new_host);
   if (web_frame) {
     web_frame->UpdateRenderFrameHost(new_host);
   }
@@ -1741,6 +1762,16 @@ void WebContents::DidFinishLoad(content::RenderFrameHost* render_frame_host,
 void WebContents::DidFailLoad(content::RenderFrameHost* render_frame_host,
                               const GURL& url,
                               int error_code) {
+  // See DocumentLoader::StartLoadingResponse() - when we navigate to a media
+  // resource the original request for the media resource, which resulted in a
+  // committed navigation, is simply discarded. The media element created
+  // inside the MediaDocument then makes *another new* request for the same
+  // media resource.
+  bool is_media_document =
+      media::IsSupportedMediaMimeType(web_contents()->GetContentsMimeType());
+  if (error_code == net::ERR_ABORTED && is_media_document)
+    return;
+
   bool is_main_frame = !render_frame_host->GetParent();
   int frame_process_id = render_frame_host->GetProcess()->GetID();
   int frame_routing_id = render_frame_host->GetRoutingID();
@@ -1761,29 +1792,41 @@ void WebContents::DidStopLoading() {
 }
 
 bool WebContents::EmitNavigationEvent(
-    const std::string& event,
+    const std::string& event_name,
     content::NavigationHandle* navigation_handle) {
   bool is_main_frame = navigation_handle->IsInMainFrame();
-  int frame_tree_node_id = navigation_handle->GetFrameTreeNodeId();
-  content::FrameTreeNode* frame_tree_node =
-      content::FrameTreeNode::GloballyFindByID(frame_tree_node_id);
-  content::RenderFrameHostManager* render_manager =
-      frame_tree_node->render_manager();
-  content::RenderFrameHost* frame_host = nullptr;
-  if (render_manager) {
-    frame_host = render_manager->speculative_frame_host();
-    if (!frame_host)
-      frame_host = render_manager->current_frame_host();
-  }
   int frame_process_id = -1, frame_routing_id = -1;
+  content::RenderFrameHost* frame_host = GetRenderFrameHost(navigation_handle);
   if (frame_host) {
     frame_process_id = frame_host->GetProcess()->GetID();
     frame_routing_id = frame_host->GetRoutingID();
   }
   bool is_same_document = navigation_handle->IsSameDocument();
   auto url = navigation_handle->GetURL();
-  return Emit(event, url, is_same_document, is_main_frame, frame_process_id,
-              frame_routing_id);
+  content::RenderFrameHost* initiator_frame_host =
+      navigation_handle->GetInitiatorFrameToken().has_value()
+          ? content::RenderFrameHost::FromFrameToken(
+                navigation_handle->GetInitiatorProcessID(),
+                navigation_handle->GetInitiatorFrameToken().value())
+          : nullptr;
+
+  v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+  v8::HandleScope handle_scope(isolate);
+
+  gin::Handle<gin_helper::internal::Event> event =
+      gin_helper::internal::Event::New(isolate);
+  v8::Local<v8::Object> event_object = event.ToV8().As<v8::Object>();
+
+  gin_helper::Dictionary dict(isolate, event_object);
+  dict.Set("url", url);
+  dict.Set("isSameDocument", is_same_document);
+  dict.Set("isMainFrame", is_main_frame);
+  dict.Set("frame", frame_host);
+  dict.SetGetter("initiator", initiator_frame_host);
+
+  EmitWithoutEvent(event_name, event, url, is_same_document, is_main_frame,
+                   frame_process_id, frame_routing_id);
+  return event->GetDefaultPrevented();
 }
 
 void WebContents::Message(bool internal,
@@ -1837,22 +1880,23 @@ class ReplyChannel : public gin::Wrappable<ReplyChannel> {
   }
   const char* GetTypeName() override { return "ReplyChannel"; }
 
+  void SendError(const std::string& msg) {
+    v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
+    // If there's no current context, it means we're shutting down, so we
+    // don't need to send an event.
+    if (!isolate->GetCurrentContext().IsEmpty()) {
+      v8::HandleScope scope(isolate);
+      auto message = gin::DataObjectBuilder(isolate).Set("error", msg).Build();
+      SendReply(isolate, message);
+    }
+  }
+
  private:
   explicit ReplyChannel(InvokeCallback callback)
       : callback_(std::move(callback)) {}
   ~ReplyChannel() override {
-    if (callback_) {
-      v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
-      // If there's no current context, it means we're shutting down, so we
-      // don't need to send an event.
-      if (!isolate->GetCurrentContext().IsEmpty()) {
-        v8::HandleScope scope(isolate);
-        auto message = gin::DataObjectBuilder(isolate)
-                           .Set("error", "reply was never sent")
-                           .Build();
-        SendReply(isolate, message);
-      }
-    }
+    if (callback_)
+      SendError("reply was never sent");
   }
 
   bool SendReply(v8::Isolate* isolate, v8::Local<v8::Value> arg) {
@@ -1877,8 +1921,14 @@ gin::Handle<gin_helper::internal::Event> WebContents::MakeEventWithSender(
     content::RenderFrameHost* frame,
     electron::mojom::ElectronApiIPC::InvokeCallback callback) {
   v8::Local<v8::Object> wrapper;
-  if (!GetWrapper(isolate).ToLocal(&wrapper))
+  if (!GetWrapper(isolate).ToLocal(&wrapper)) {
+    if (callback) {
+      // We must always invoke the callback if present.
+      ReplyChannel::Create(isolate, std::move(callback))
+          ->SendError("WebContents was destroyed");
+    }
     return gin::Handle<gin_helper::internal::Event>();
+  }
   gin::Handle<gin_helper::internal::Event> event =
       gin_helper::internal::Event::New(isolate);
   gin_helper::Dictionary dict(isolate, event.ToV8().As<v8::Object>());
@@ -1955,6 +2005,9 @@ void WebContents::MessageHost(const std::string& channel,
 
 void WebContents::UpdateDraggableRegions(
     std::vector<mojom::DraggableRegionPtr> regions) {
+  if (owner_window() && owner_window()->has_frame())
+    return;
+
   draggable_region_ = DraggableRegionsToSkRegion(regions);
 }
 
@@ -2897,7 +2950,7 @@ void WebContents::Print(gin::Arguments* args) {
 
   // We've already done necessary parameter sanitization at the
   // JS level, so we can simply pass this through.
-  base::Value media_size(base::Value::Type::DICTIONARY);
+  base::Value media_size(base::Value::Type::DICT);
   if (options.Get("mediaSize", &media_size))
     settings.Set(printing::kSettingMediaSize, std::move(media_size));
 
@@ -3589,18 +3642,26 @@ v8::Local<v8::Promise> WebContents::TakeHeapSnapshot(
   flags = base::File::AddFlagsForPassingToUntrustedProcess(flags);
   base::File file(file_path, flags);
   if (!file.IsValid()) {
-    promise.RejectWithErrorMessage("takeHeapSnapshot failed");
+    promise.RejectWithErrorMessage(
+        "Failed to take heap snapshot with invalid file path " +
+#if BUILDFLAG(IS_WIN)
+        base::WideToUTF8(file_path.value()));
+#else
+        file_path.value());
+#endif
     return handle;
   }
 
   auto* frame_host = web_contents()->GetPrimaryMainFrame();
   if (!frame_host) {
-    promise.RejectWithErrorMessage("takeHeapSnapshot failed");
+    promise.RejectWithErrorMessage(
+        "Failed to take heap snapshot with invalid webContents main frame");
     return handle;
   }
 
   if (!frame_host->IsRenderFrameLive()) {
-    promise.RejectWithErrorMessage("takeHeapSnapshot failed");
+    promise.RejectWithErrorMessage(
+        "Failed to take heap snapshot with nonexistent render frame");
     return handle;
   }
 
@@ -3620,7 +3681,7 @@ v8::Local<v8::Promise> WebContents::TakeHeapSnapshot(
             if (success) {
               promise.Resolve();
             } else {
-              promise.RejectWithErrorMessage("takeHeapSnapshot failed");
+              promise.RejectWithErrorMessage("Failed to take heap snapshot");
             }
           },
           base::Owned(std::move(electron_renderer)), std::move(promise)));
@@ -3830,8 +3891,8 @@ void WebContents::DevToolsIndexPath(
   if (devtools_indexing_jobs_.count(request_id) != 0)
     return;
   std::vector<std::string> excluded_folders;
-  std::unique_ptr<base::Value> parsed_excluded_folders =
-      base::JSONReader::ReadDeprecated(excluded_folders_message);
+  absl::optional<base::Value> parsed_excluded_folders =
+      base::JSONReader::Read(excluded_folders_message);
   if (parsed_excluded_folders && parsed_excluded_folders->is_list()) {
     for (const base::Value& folder_path : parsed_excluded_folders->GetList()) {
       if (folder_path.is_string())
